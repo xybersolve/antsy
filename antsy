@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# ================================================================
+# -*- mode: bash -*-
+# vi: set ft=sh
+# ****************************************************************
+#
+# DESCRIPTION
+#    Script installs & configures ansible projects on Ubuntu server
+#
+# OPTIONS & EXAMPLES
+#   See SYNTAX (below)
+#
+# ----------------------------------------------------------------
+# IMPLEMENTATION
+#    version         script 0.1.4
+#    author          Greg Milligan
+#    copyright       Copyright (c) 2017 http://www.xybersolve.com
+#    license         GNU General Public License
+#
+# ================================================================
+#  DEBUG OPTION
+#    set -n  # Uncomment to check your syntax, without execution.
+#    set -x  # Uncomment to debug this shell script
+#
+# ---------------------------------------------------------------
+#
+# TODO: Need to do this
+# ****************************************************************
+
+
+# ---------------------------------------
+# CONFIGFURATION
+# ---------------------------------------
+# strict environment
+set -o errexit  # exit on command error status
+set -o nounset  # no unreadonlyd variables
+set -o pipefail # failr on pipe failures
+trap 'echo "Aborting due to errexit on line $LINENO. Exit code: ${?}" >&2' ERR
+
+# ---------------------------------------
+# GLOBAL VARIABLES
+# ---------------------------------------
+# booleans
+declare -ir TRUE=1
+declare -ir FALSE=0
+# script info
+
+declare -r PROGNAME="$(basename ${0})"
+declare -r VERSION=0.0.1
+declare -r SUBJECT=""
+declare -r KEYS=""
+declare -ri MIN_ARG_COUNT=1
+declare -r SYNTAX=$(cat <<EOF
+
+    Script: ${PROGNAME}
+    Purpose:
+    Usage: ${PROGNAME} [-h|--help] [-v|--version]
+
+    Options:
+      -h|--help:  help and usage
+      -v| --version: show version info
+      --install: Install ansible on Ubuntu
+      --setup: Setup & configure local ansible project
+      --keys: Setup keys for client automation access
+      --dist: Distribute scripts to ansible control station
+      --sync: Synchronize local ansible code up to control server (rsync)
+      --watch: Synchronize automatically anytime code is updated
+
+    ${PROGNAME} --install
+    ${PROGNAME} --setup
+    ${PROGNAME} --keys
+    ${PROGNAME} --info
+    ${PROGNAME} --install --setup --keys --info
+    ${PROGNAME} --sync
+    ${PROGNAME} --watch
+
+EOF
+)
+# files & directories
+declare -r SCRIPT_DIR="$( dirname ${0} )"
+declare -r CONFIG_FILE="${SCRIPT_DIR}/antsy.config.sh"
+
+# actions
+declare -i INSTALL_ANSIBLE=${FALSE}
+declare -i SETUP_ANSIBLE=${FALSE}
+declare -i SETUP_KEYS=${FALSE}
+declare -i CHECK_INFO=${FALSE}
+declare -i DISTRIBUTE=${FALSE}
+declare -i SYNC=${FALSE}
+declare -i WATCH=${FALSE}
+
+# generators
+declare -i GEN_ROLE=${FALSE}
+
+# variables
+declare -r EMAIL='xybersolve@gmail.com'
+declare NAME=""
+# ---------------------------------------
+# COMMON FUNCTIONS
+# ---------------------------------------
+usage() {
+  echo "${SYNTAX}"
+}
+
+error() {
+  printf "\n%s\n" "Error: ${1}"
+}
+
+die() {
+  error "${1}"
+  usage
+  printf "\n\n"
+  exit "${2:-1}"
+}
+
+show_version() {
+  printf "\n\n%s  %s\n\n\n" "${PROGNAME}" "${VERSION}"
+  exit 0
+}
+
+show_help() {
+  printf "\n\n"
+  usage
+  printf "\n\n"
+  exit 0
+}
+
+# ---------------------------------------
+# MAIN CODE GOES HERE
+# ---------------------------------------
+source "${CONFIG_FILE}" \
+  || die "Unable to load config file: ${CONFIG_FILE}" 2
+
+__python() {
+  sudo apt-get update
+  sudo apt-get install python-minimal -y
+  python --version
+}
+
+__packages() {
+  # packages you need
+  sudo apt-get install software-properties-common python python-pip -y
+  sudo apt-get install sshpass -y
+
+  # packages that you will want to have
+  sudo apt-get install apt-transport-https ca-certificates -y
+  sudo apt-get install python-dev libffi-dev libssl-dev -y
+}
+
+__pip() {
+  sudo -H pip install pip --upgrade
+  sudo -H pip install setuptools --upgrade
+  sudo -H pip install pyopenssl ndg-httpsclient pyasn1
+  sudo -H pip install ansible
+}
+
+__validate_install() {
+  echo
+  echo "Which Ansible"
+  echo $(which ansible)
+  echo
+  echo "Ansible Version"
+  /usr/local/bin/ansible --version
+
+}
+__install_ansible() {
+  __python
+  __packages
+  __pip
+  __validate_install
+}
+
+__setup_config() {
+  sudo mkdir -p /etc/ansible
+  # local host
+  echo -e "[local]\n127.0.0.1" | sudo tee -a /etc/ansible/hosts
+  # global config
+  sudo wget -O /etc/ansible/ansible.cfg \
+    https://raw.githubusercontent.com/ansible/ansible/devel/examples/ansible.cfg
+}
+
+__setup_project() {
+  # setup project directoies
+  mkdir -p ${PROJECT_DIR}/{files,playbooks,templates,group_vars}
+
+  # local inventory
+  echo -e "[local]\n127.0.0.1" >> ${PROJECT_DIR}/hosts
+
+  # use global config and later customize
+  # only copy it the first time, don't overwrite chages
+  cp /etc/ansible/ansible.cfg ${PROJECT_DIR}/ansible.cfg
+
+  # ansible config for local dev
+  echo 'ANSIBLE_CONFIG=~/ansible/ansible.cfg' >> ~/.profile
+
+  source ~/.profile
+
+  # TODO: sed this into cfg file
+  # inventory = ~/ansible/hosts
+  # log_path = ~/ansible/ansible.log
+  # private_key_file = ~/.ssh/id_rsa
+
+  echo "Ansible Configuration Test"
+  ansible --version
+}
+
+__validate_setup() {
+  # ensure ssh server running on box
+  sudo service ssh status
+  netstat -an | grep 22 | grep "LISTEN "
+
+  # avoids ssh prompt or disable of host_key_checking in config
+  'ssh-keyscan 127.0.0.1' >> ~/.ssh/known_hosts
+
+  # ping hosts in inventory
+  # connect as 'ubuntu' user, -k: ask for password
+  # ansible all -m ping -u ubuntu -k
+}
+
+__setup_ansible() {
+    [[ -d ${PROJECT_DIR}/playbooks ]] \
+      && { echo "Project is already set up." ; return 0; }
+
+  __setup_config
+  __setup_project
+  __validate_setup
+}
+
+__setup_keys() {
+  # generate: ansible_control_rsa keys
+  local -r keyType="rsa"
+  local -r keyName="ansible_control_${keyType}"
+  if [[ -f ~/.ssh/${keyName} ]]; then
+    echo "Keys: ${keyName} appear to alreadt be set up."
+    return 0
+  fi
+
+  cd ~/.ssh
+  echo "Press Enter, no password desired"
+  ssh-keygen -t "${keyType}" -C "${EMAIL}" -f "${keyName}"
+  # copy public key to ansible files
+  cp ./${keyName}.pub ${PROJECT_DIR}/files/${keyName}.pub
+
+  # for use in
+  # ansible-playbook playbooks/bootstrap-ubuntu.yaml -u ubuntu -k
+}
+
+__check_info() {
+  # get free memory of localhost
+  ansible 127.0.0.1 -m shell -a "free -m" -u ubuntu -k
+
+  # use setup module to show facts about localhost
+  ansible 127.0.0.1 -m setup -u ubuntu -k
+
+  # use shell module to show bound ports on localhost
+  ansible 127.0.0.1 -m shell -a "netstat -an | grep 'LISTEN '" -u ubuntu -k
+}
+#
+# Generation support routines
+#
+__gen_yaml_file() {
+  local -r filepath="${1}"
+  [[ -e "${filepath}" ]] || echo '---' > "${filepath}"
+
+}
+__gen_file() {
+  local -r filepath="${1}"
+  [[ -e "${filepath}" ]] || touch "${filepath}"
+}
+__set_perms() {
+  local dir="${1}"
+  find "${dir}" -type d -exec chmod 755 {} \;
+  find "${dir}" -type f -exec chmod 644 {} \;
+}
+__test_dir() {
+  local -r dir="${1}"
+  [[ -d ${dir} ]] && die "Directory already exists: ${dir}"
+}
+#
+# Generators
+#
+
+__gen_role() {
+  local -r base_dir="${PROJECT_DIR}/roles/${NAME}"
+  printf "Creating Role: %s\n" "${base_dir}"
+
+  __test_dir ${base_dir}
+
+  mkdir -p ${base_dir}/{tasks,handlers}
+  __gen_yaml_file "${base_dir}/tasks/main.yml"
+  __gen_file "${base_dir}/handlers/main.yml"
+  __set_perms "${base_dir}"
+}
+
+__distribute() {
+  # copy script & config to ~/bin
+  cp antsy ~/bin
+  cp antsy.config.sh ~/bin
+
+  # distribute this script to ansible server
+  scp antsy ${REMOTE_HOST}:${REMOTE_DIR}
+  scp antsy.config.sh ${REMOTE_HOST}:${REMOTE_DIR}
+}
+
+
+__synchronize() {
+  rsync -av ${PROJECT_DIR}/* ${REMOTE_HOST}:${REMOTE_DIR}/
+}
+__watch() {
+  cd "${PROJECT_DIR}"
+  watch -n 3 "${0}" --sync
+}
+
+
+__get_opts() {
+  while (( $# > 0 )); do
+    local arg="${1}"; shift;
+    case ${arg} in
+      --help)    show_help                ;;
+      --version) show_version             ;;
+      --install)  INSTALL_ANSIBLE=${TRUE} ;;
+      --setup)    SETUP_ANSIBLE=${TRUE}   ;;
+      --keys)     SETUP_KEYS=${TRUE}      ;;
+      --info)     CHECK_INFO=${TRUE}      ;;
+      --sync)     SYNC=${TRUE}            ;;
+      --watch)    WATCH=${TRUE}           ;;
+      --role*) GEN_ROLE=${TRUE}
+        [[ ${arg:-''} =~ '=' ]] && NAME="${arg#*=}" ;;
+      --dist)     DISTRIBUTE=${TRUE}      ;;
+      *) die "Unknown option: ${arg}" ;;
+   esac
+  done
+  return 0
+}
+
+__dispatch() {
+  # order can matter here
+  (( INSTALL_ANSIBLE )) && __install_ansible
+  (( SETUP_ANSIBLE )) && __setup_ansible
+  (( SETUP_KEYS )) && __setup_keys
+  (( CHECK_INFO )) && __check_info
+  (( GEN_ROLE )) && __gen_role
+  (( DISTRIBUTE )) && __distribute
+  (( SYNC )) && __synchronize
+  (( WATCH )) && __watch
+  return 0
+}
+
+main() {
+  (( ${#} < MIN_ARG_COUNT )) && error "err message here" 1
+  (( $# > 0 )) && __get_opts "$@"
+
+  __dispatch
+
+  return 0
+}
+(( ${#} > 0 )) && main "${@}" || main
