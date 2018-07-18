@@ -20,3 +20,6 @@
 [._]s[a-v][a-z]
 Session.vim
 tags
+
+# project
+roles

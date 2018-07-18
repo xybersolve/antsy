@@ -5,7 +5,7 @@
 # ****************************************************************
 #
 # DESCRIPTION
-#    Script installs & configures ansible projects on Ubuntu server
+#    Script assists to install & configure ansible projects
 #
 # OPTIONS & EXAMPLES
 #   See SYNTAX (below)
@@ -53,26 +53,40 @@ declare -ri MIN_ARG_COUNT=1
 declare -r SYNTAX=$(cat <<EOF
 
     Script: ${PROGNAME}
-    Purpose:
+    Purpose: Manage ansible projects, setup and configuration
     Usage: ${PROGNAME} [-h|--help] [-v|--version]
 
     Options:
-      -h|--help:  help and usage
-      -v| --version: show version info
+      --help:  help and usage
+      --version: show version info
       --install: Install ansible on Ubuntu
       --setup: Setup & configure local ansible project
       --keys: Setup keys for client automation access
-      --dist: Distribute scripts to ansible control station
-      --sync: Synchronize local ansible code up to control server (rsync)
+      --dist: Copy scripts to scripts bin directory
+      --sync: Synchronize local ansible code to bastion server (rsync)
       --watch: Synchronize automatically anytime code is updated
 
-    ${PROGNAME} --install
-    ${PROGNAME} --setup
-    ${PROGNAME} --keys
-    ${PROGNAME} --info
-    ${PROGNAME} --install --setup --keys --info
-    ${PROGNAME} --sync
-    ${PROGNAME} --watch
+      --role=<role_name>: create a role
+        -h|--handlers: create 'handlers'
+        -t|--temp*: create 'templates'
+        -f|--files: create 'files'
+        -d|--defaults: create 'defaults'
+        -p: use current directory
+
+    Examples:    
+      ${PROGNAME} --install
+      ${PROGNAME} --check-stack
+      ${PROGNAME} --setup
+      ${PROGNAME} --keys
+      ${PROGNAME} --info
+      ${PROGNAME} --install --setup --keys --info
+      ${PROGNAME} --sync
+      ${PROGNAME} --role=mysql -p -d -h -f -t
+      ${PROGNAME} --role=mysql -p --defaults --handlers -files --temp
+      ${PROGNAME} --watch
+      ${PROGNAME} --dist --host=54.241.221.184 --user=ubuntu --dir=bin
+      ${PROGNAME} --dist --hostname=control --dir=bin
+
 
 EOF
 )
@@ -88,13 +102,26 @@ declare -i CHECK_INFO=${FALSE}
 declare -i DISTRIBUTE=${FALSE}
 declare -i SYNC=${FALSE}
 declare -i WATCH=${FALSE}
+declare -i CHECK_STACK=${FALSE}
 
 # generators
 declare -i GEN_ROLE=${FALSE}
 
+# flags
+declare -i USE_CURRENT_DIR=${FALSE}
+declare -i CREATE_DEFAULTS=${FALSE}
+declare -i CREATE_HANDLERS=${FALSE}
+declare -i CREATE_FILES=${FALSE}
+declare -i CREATE_TEMPLATES=${FALSE}
+
 # variables
 declare -r EMAIL='xybersolve@gmail.com'
-declare NAME=""
+declare NAME=''
+declare SCP_HOST=''
+declare SCP_HOSTNAME=''
+declare SCP_USER=''
+declare SCP_DIR=''
+
 # ---------------------------------------
 # COMMON FUNCTIONS
 # ---------------------------------------
@@ -156,7 +183,7 @@ __pip() {
 
 __validate_install() {
   echo
-  echo "Which Ansible"
+  echo "Which Ansible:"
   echo $(which ansible)
   echo
   echo "Ansible Version"
@@ -171,12 +198,17 @@ __install_ansible() {
 }
 
 __setup_config() {
-  sudo mkdir -p /etc/ansible
+  [[ -d /etc/ansible ]] || sudo mkdir -p /etc/ansible
+
   # local host
-  echo -e "[local]\n127.0.0.1" | sudo tee -a /etc/ansible/hosts
+  [[ -f /etc/ansible/hosts ]] \
+    || echo -e "[local]\n127.0.0.1" | sudo tee -a /etc/ansible/hosts
+
   # global config
-  sudo wget -O /etc/ansible/ansible.cfg \
-    https://raw.githubusercontent.com/ansible/ansible/devel/examples/ansible.cfg
+  if [[ ! -f /etc/ansible/ansible.cfg ]]; then
+    sudo wget -O /etc/ansible/ansible.cfg \
+      https://raw.githubusercontent.com/ansible/ansible/devel/examples/ansible.cfg
+  fi
 }
 
 __setup_project() {
@@ -184,14 +216,14 @@ __setup_project() {
   mkdir -p ${PROJECT_DIR}/{files,playbooks,templates,group_vars}
 
   # local inventory
-  echo -e "[local]\n127.0.0.1" >> ${PROJECT_DIR}/hosts
+  sudo echo -e "[local]\n127.0.0.1" >> ${PROJECT_DIR}/hosts
 
   # use global config and later customize
   # only copy it the first time, don't overwrite chages
-  cp /etc/ansible/ansible.cfg ${PROJECT_DIR}/ansible.cfg
+  sudo cp /etc/ansible/ansible.cfg ${PROJECT_DIR}/ansible.cfg
 
   # ansible config for local dev
-  echo 'ANSIBLE_CONFIG=~/ansible/ansible.cfg' >> ~/.profile
+  sudo echo 'ANSIBLE_CONFIG=~/ansible/ansible.cfg' >> ~/.profile
 
   source ~/.profile
 
@@ -210,11 +242,11 @@ __validate_setup() {
   netstat -an | grep 22 | grep "LISTEN "
 
   # avoids ssh prompt or disable of host_key_checking in config
-  'ssh-keyscan 127.0.0.1' >> ~/.ssh/known_hosts
+  #sudo 'ssh-keyscan -H 127.0.0.1' >> ~/.ssh/known_hosts
 
   # ping hosts in inventory
   # connect as 'ubuntu' user, -k: ask for password
-  # ansible all -m ping -u ubuntu -k
+  ansible all -m ping -u ubuntu -k
 }
 
 __setup_ansible() {
@@ -237,12 +269,36 @@ __setup_keys() {
 
   cd ~/.ssh
   echo "Press Enter, no password desired"
-  ssh-keygen -t "${keyType}" -C "${EMAIL}" -f "${keyName}"
+  sudo ssh-keygen -t "${keyType}" -C "${EMAIL}" -f "${keyName}"
   # copy public key to ansible files
-  cp ./${keyName}.pub ${PROJECT_DIR}/files/${keyName}.pub
+  sudo cp ./${keyName}.pub ${PROJECT_DIR}/files/${keyName}.pub
 
   # for use in
   # ansible-playbook playbooks/bootstrap-ubuntu.yaml -u ubuntu -k
+}
+
+__ssh_setup() {
+  sudo ssh-agent bash
+  sudo ssh-add ~/.ssh/transible-key
+}
+
+__check_app() {
+  local -r app="${1}"
+  printf "\nChecking: %s\n" "${app}"
+  which "${app}"
+  "${app}" --version
+}
+
+__check_stack() {
+  printf "\nChecking ssh-agent\n"
+  ssh-add -l
+
+  __check_app python
+  __check_app terraform
+  __check_app ansible
+  __check_app aws
+
+  printf "\n\n"
 }
 
 __check_info() {
@@ -258,15 +314,45 @@ __check_info() {
 #
 # Generation support routines
 #
+__check_dir() {
+  local -r dir="$(dirname ${1})"
+  [[ -d "${dir}" ]] || mkdir -p "${dir}"
+}
+
 __gen_yaml_file() {
   local -r filepath="${1}"
-  [[ -e "${filepath}" ]] || echo '---' > "${filepath}"
+  __check_dir "${filepath}"
+  [[ -e "${filepath}" ]] || echo -e '---\n' > "${filepath}"
 
 }
+
+__gen_directory() {
+  local -r dir="${1}"
+  [[ -d "${dir}" ]] || mkdir -p "${dir}"
+}
+
 __gen_file() {
   local -r filepath="${1}"
+  __check_dir "${filepath}"
   [[ -e "${filepath}" ]] || touch "${filepath}"
 }
+
+__gen_include() {
+  # include the code named file into 'main.yaml' - for role
+  local -r dir="${1}"
+  local -r name="${2}"
+
+  # exit function if directory already exists, but continue process
+  [[ -d "${dir}" ]] \
+    && return 0 \
+    || mkdir -p "${dir}";
+
+  # the include file
+  echo -e "---\n- include: ${name}.yaml\n" > "${dir}/main.yml"
+  # the main code file
+  echo -e "---\n" > "${dir}/${name}.yml"
+}
+
 __set_perms() {
   local dir="${1}"
   find "${dir}" -type d -exec chmod 755 {} \;
@@ -279,29 +365,77 @@ __test_dir() {
 #
 # Generators
 #
-
 __gen_role() {
-  local -r base_dir="${PROJECT_DIR}/roles/${NAME}"
+  # ? use current working directory
+  (( USE_CURRENT_DIR )) \
+    && local -r base_dir="$(pwd)/roles/${NAME}" \
+    || local -r base_dir="${PROJECT_DIR}/roles/${NAME}"
+  #local -r base_dir="${PROJECT_DIR}/roles/${NAME}"
   printf "Creating Role: %s\n" "${base_dir}"
 
-  __test_dir ${base_dir}
+  ##__test_dir ${base_dir}
 
-  mkdir -p ${base_dir}/{tasks,handlers}
-  __gen_yaml_file "${base_dir}/tasks/main.yml"
-  __gen_file "${base_dir}/handlers/main.yml"
+  [[ -d "${base_dir}" ]] || mkdir -p "${base_dir}"
+  #__gen_yaml_file "${base_dir}/tasks/main.yml"
+  # always create tasks
+  __gen_yaml_file "${base_dir}/tasks/main.yaml"
+  #__gen_yaml_file "${base_dir}/${NAME}.yml"
+  #__gen_file "${base_dir}/handlers/main.yml"
+  (( CREATE_HANDLERS )) \
+    &&  __gen_yaml_file "${base_dir}/handlers/main.yaml"
+    #&&  __gen_include "${base_dir}/handlers" "${NAME}-handlers"
+
+  (( CREATE_DEFAULTS )) \
+    &&  __gen_yaml_file "${base_dir}/defaults/main.yaml"
+    #&& __gen_include "${base_dir}/defaults" "${NAME}-defaults"
+
+  (( CREATE_FILES )) \
+    && __gen_directory "${base_dir}/files"
+
+  (( CREATE_TEMPLATES )) \
+      && __gen_directory "${base_dir}/templates"
+
   __set_perms "${base_dir}"
 }
 
 __distribute() {
+  [[ ~/bin/xs-antsy =~ $(pwd) ]] || die "Not in project directory" 4
+
   # copy script & config to ~/bin
-  cp antsy ~/bin
-  cp antsy.config.sh ~/bin
+  local to=~/bin
+  local -a files=(
+    antsy
+    antsy.config.sh
+    #ec2.ini
+    #cp ec2.py
+  )
+
+  printf "\n"
+  for file in "${files[@]}"; do
+    cp ${file} ${to} \
+      && printf "👍🏻  Copied: %s to %s\n" "${file}" "${to}"
+  done
+  printf "\n"
+
+  # Copy to Remote Server
+  [[ -n ${SCP_HOST} && -n ${SCP_USER} ]] \
+    && SCP_HOSTNAME="${SCP_USER}@${SCP_HOST}"
 
   # distribute this script to ansible server
-  scp antsy ${REMOTE_HOST}:${REMOTE_DIR}
-  scp antsy.config.sh ${REMOTE_HOST}:${REMOTE_DIR}
-}
+  if [[ -n ${SCP_HOSTNAME} && -n ${SCP_DIR} ]]; then
+    for file in "${files[@]}"; do
+      scp "${file}" ${SCP_HOSTNAME}:${SCP_DIR}
+    done
+  fi
 
+  # if [[ -n ${SCP_HOST} && -n ${SCP_USER} && -n ${SCP_DIR} ]]; then
+  #   for file in "${files[@]}"; do
+  #     scp "${file}" ${SCP_USER}@${SCP_HOST}:${SCP_DIR}
+  #   done
+  # fi
+  #scp ec2.ini ${REMOTE_HOST}:${REMOTE_DIR}
+  #scp ec2.py ${REMOTE_HOST}:${REMOTE_DIR}
+}
 
 __synchronize() {
   rsync -av ${PROJECT_DIR}/* ${REMOTE_HOST}:${REMOTE_DIR}/
@@ -313,6 +447,7 @@ __watch() {
 
 
 __get_opts() {
+
   while (( $# > 0 )); do
     local arg="${1}"; shift;
     case ${arg} in
@@ -324,9 +459,34 @@ __get_opts() {
       --info)     CHECK_INFO=${TRUE}      ;;
       --sync)     SYNC=${TRUE}            ;;
       --watch)    WATCH=${TRUE}           ;;
-      --role*) GEN_ROLE=${TRUE}
+      --check-stack) CHECK_STACK=${TRUE}  ;;
+
+      # Role Generation
+      --role*) # role and its name; --role=myRole
+        GEN_ROLE=${TRUE}
         [[ ${arg:-''} =~ '=' ]] && NAME="${arg#*=}" ;;
+      -p|--pwd)   USE_CURRENT_DIR=${TRUE} ;;
+      -d|--def*)  CREATE_DEFAULTS=${TRUE} ;;
+      -h|--han*)  CREATE_HANDLERS=${TRUE} ;;
+      -f|--files) CREATE_FILES=${TRUE}    ;;
+      -t|--temp*) CREATE_TEMPLATES=${TRUE} ;;
+      -a|--all)
+          CREATE_DEFAULTS=${TRUE}
+          CREATE_HANDLERS=${TRUE}
+      ;;
+
+      # Distribute
       --dist)     DISTRIBUTE=${TRUE}      ;;
+      --hostname*)
+        [[ ${arg:-''} =~ '=' ]] && SCP_HOSTNAME="${arg#*=}" ;;
+      --host*) # used by --dist
+        [[ ${arg:-''} =~ '=' ]] && SCP_HOST="${arg#*=}" ;;
+      --user*) # used by --dist
+        [[ ${arg:-''} =~ '=' ]] && SCP_USER="${arg#*=}" ;;
+      --dir*) # used by --dist
+        [[ ${arg:-''} =~ '=' ]] && SCP_DIR="${arg#*=}" ;;
+
+      # Otherwise
       *) die "Unknown option: ${arg}" ;;
    esac
   done
@@ -335,6 +495,7 @@ __get_opts() {
 
 __dispatch() {
   # order can matter here
+  (( CHECK_STACK )) && __check_stack
   (( INSTALL_ANSIBLE )) && __install_ansible
   (( SETUP_ANSIBLE )) && __setup_ansible
   (( SETUP_KEYS )) && __setup_keys
@@ -343,6 +504,7 @@ __dispatch() {
   (( DISTRIBUTE )) && __distribute
   (( SYNC )) && __synchronize
   (( WATCH )) && __watch
+
   return 0
 }
 
@@ -355,3 +517,42 @@ main() {
   return 0
 }
 (( ${#} > 0 )) && main "${@}" || main
+
+:<<PYTHON_INSTALL
+# Notes on getting python properly configured on MacOS
+# Critical for boto and AWS automation
+
+$ brew install python@2
+
+# in .bashrc - SUPER IMPORTANT
+export PATH="/usr/local/opt/python@2/libexec/bin:$PATH"
+
+# check
+$ which(python)
+$ which (python2)
+$ python -V
+$ python2 -V
+$ pip -V
+$ pip2 -V
+
+VirtualEnv
+# intall
+$ pip install virtualenv
+$ virtualenv --version
+
+# setup project
+$ cd my_project_folder
+$ virtualenv my_project
+
+# activate & deactivate
+$ source my_project/bin/activate
+$ deactivate
+
+Ansible
+# ansible install
+$ pip install ansible --quiet
+
+# ansible upgrade
+$ pip install ansible --upgrade
+
+PYTHON_INSTALL
